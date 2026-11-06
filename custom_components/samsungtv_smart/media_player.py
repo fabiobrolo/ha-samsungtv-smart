@@ -6,7 +6,9 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+import json
 import logging
+import os
 from socket import error as socketError
 from time import sleep
 from typing import Any
@@ -417,22 +419,20 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         apps_st = {}
 
         for app_name, app_ids in app_list.items():
-            try:
-                app_id_split = app_ids.split(ST_APP_SEPARATOR, 1)
-            except (ValueError, AttributeError):
-                _LOGGER.warning(
-                    "Invalid ID [%s] for App [%s] will be ignored."
-                    " Use integration options to correct the App ID",
-                    app_ids,
-                    app_name,
-                )
+            if not isinstance(app_ids, str):
                 continue
+            if "/" in app_ids:
+                app_id_split = app_ids.split("/", 1)
+            elif ST_APP_SEPARATOR in app_ids:
+                app_id_split = app_ids.split(ST_APP_SEPARATOR, 1)
+            else:
+                app_id_split = [app_ids]
 
-            app_id = app_id_split[0]
+            app_id = app_id_split[0].strip()
             if len(app_id_split) == 1:
                 _, st_app_id, _ = _get_default_app_info(app_id)
             else:
-                st_app_id = app_id_split[1]
+                st_app_id = app_id_split[1].strip()
 
             apps[app_name] = app_id
             apps_st[app_name] = st_app_id or app_id
@@ -453,6 +453,36 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         # load apps list
         app_list = self._get_option(CONF_APP_LIST, {})
+        if not app_list:
+            dump_file = "/config/samsung_apps_dump.json"
+            if os.path.exists(dump_file):
+                try:
+                    with open(dump_file, "r", encoding="utf-8") as f:
+                        app_list = json.load(f)
+                except Exception as exc:  # pylint: disable=broad-except
+                    _LOGGER.debug("Error loading %s: %s", dump_file, exc)
+
+        if not app_list:
+            app_list = {
+                "YouTube": "111299001912/9Ur5IzDKqV.TizenYouTube",
+                "Netflix": "11101200001/RN1MCdNq8t.Netflix",
+                "Prime Video": "3201512006785/org.tizen.ignition",
+                "Disney+": "3201901017640/MCmYXNxgcu.DisneyPlus",
+                "Globoplay": "3201608010419/bF1r982pS3.Globoplay",
+                "Max": "3201601007625/9Ur5IzDKqV.Max",
+                "Jellyfin": "rTn6ClEurC.Jellyfin",
+                "Paramount+": "3202110025305/rJyOSqC6Up.PPlusIntl",
+                "Spotify": "3201606009684/rJeHak5zRg.Spotify",
+                "Plex": "3201512006963/kIciSQlYEM.plex",
+                "Apple TV": "3201807016597/org.tizen.apple-tv",
+                "Internet": "org.tizen.browser",
+            }
+            try:
+                with open("/config/samsung_apps_dump.json", "w", encoding="utf-8") as f:
+                    json.dump(app_list, f, indent=2, ensure_ascii=False)
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.debug("Failed writing initial /config/samsung_apps_dump.json: %s", exc)
+
         if app_list:
             double_list = self._split_app_list(app_list)
             self._app_list = double_list[0]
@@ -626,12 +656,12 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         if self._dump_apps:
             self._dump_apps = self._get_option(CONF_DUMP_APPS, False)
 
-        if not (self._app_list is None or self._dump_apps):
-            return
-
         app_list = self._ws.installed_app
         if not app_list:
-            return
+            if self._ws.is_connected:
+                self._ws._request_apps_list()
+            if self._app_list is not None:
+                return
 
         app_load_method = AppLoadMethod(
             self._get_option(CONF_APP_LOAD_METHOD, AppLoadMethod.All.value)
@@ -641,26 +671,34 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         filtered_app_list = {}
         filtered_app_list_st = {}
         dump_app_list = {}
-        for app in app_list.values():
+        if app_list:
+            for app in app_list.values():
+                try:
+                    app_name = app.app_name
+                    app_id = app.app_id
+                    def_app_id, st_app_id, _ = _get_default_app_info(app_id)
+                    # app_list is automatically created only with apps in hard coded short
+                    # list (STD_APP_LIST). Other available apps are dumped in a file that
+                    # can be used to create a custom list.
+                    # This is to avoid unuseful long list that can impact performance
+                    if app_load_method != AppLoadMethod.NotLoad:
+                        if def_app_id or app_load_method == AppLoadMethod.All:
+                            filtered_app_list[app_name] = app_id
+                            filtered_app_list_st[app_name] = st_app_id or app_id
+
+                    dump_app_list[app_name] = (
+                        app_id + ST_APP_SEPARATOR + st_app_id if st_app_id else app_id
+                    )
+
+                except Exception:  # pylint: disable=broad-except
+                    pass
+
+        if dump_app_list:
             try:
-                app_name = app.app_name
-                app_id = app.app_id
-                def_app_id, st_app_id, _ = _get_default_app_info(app_id)
-                # app_list is automatically created only with apps in hard coded short
-                # list (STD_APP_LIST). Other available apps are dumped in a file that
-                # can be used to create a custom list.
-                # This is to avoid unuseful long list that can impact performance
-                if app_load_method != AppLoadMethod.NotLoad:
-                    if def_app_id or app_load_method == AppLoadMethod.All:
-                        filtered_app_list[app_name] = app_id
-                        filtered_app_list_st[app_name] = st_app_id or app_id
-
-                dump_app_list[app_name] = (
-                    app_id + ST_APP_SEPARATOR + st_app_id if st_app_id else app_id
-                )
-
-            except Exception:  # pylint: disable=broad-except
-                pass
+                with open("/config/samsung_apps_dump.json", "w", encoding="utf-8") as f:
+                    json.dump(dump_app_list, f, indent=2, ensure_ascii=False)
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGER.debug("Failed writing /config/samsung_apps_dump.json: %s", exc)
 
         if self._app_list is None:
             self._app_list = filtered_app_list
@@ -673,6 +711,24 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
                 dump_app_list,
             )
             self._dump_apps = False
+
+        if self._st and self._st.channel_name and self._running_app != DEFAULT_APP:
+            run_id = self._st.channel_name
+            if self._app_list and run_id not in self._app_list.values():
+                app_name = run_id.split(".")[-1] if "." in run_id else run_id
+                self._app_list[app_name] = run_id
+                self._app_list_st[app_name] = run_id
+                try:
+                    dump_file = "/config/samsung_apps_dump.json"
+                    curr_dump = {}
+                    if os.path.exists(dump_file):
+                        with open(dump_file, "r", encoding="utf-8") as f:
+                            curr_dump = json.load(f)
+                    curr_dump[app_name] = run_id
+                    with open(dump_file, "w", encoding="utf-8") as f:
+                        json.dump(curr_dump, f, indent=2, ensure_ascii=False)
+                except Exception:  # pylint: disable=broad-except
+                    pass
 
     def _get_source(self):
         """Return the current input source."""
@@ -687,8 +743,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         if self._st.source in ["digitalTv", "TV"]:
             cloud_key = "ST_TV"
-        else:
+        elif self._st.source:
             cloud_key = "ST_" + self._st.source
+        else:
+            cloud_key = None
 
         found_source = self._running_app
         for attr, value in self._source_list.items():
@@ -725,7 +783,7 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
             await self._st.async_send_command("stepchannel", "down")
         elif source_key.startswith("ST_CH"):
             ch_num = source_key.replace("ST_CH", "")
-            if ch_num.isdigit():
+            if ch_num.replace(".", "").replace("-", "").isdigit():
                 await self._st.async_send_command("selectchannel", ch_num)
         elif source_key in ["ST_MUTE", "ST_UNMUTE"]:
             await self._st.async_send_command(
@@ -1416,8 +1474,12 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         if not channel_source:
             if self._running_app == DEFAULT_APP:
                 return True
-            _LOGGER.error("Current source invalid for channel")
-            return False
+            if self._source_list and "TV" in self._source_list:
+                await self.async_select_source("TV")
+                await asyncio.sleep(2)
+            else:
+                self._running_app = DEFAULT_APP
+            return True
 
         if self._source == channel_source:
             return True
@@ -1447,10 +1509,9 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
         if len(channel_cmd) > 1:
             channel_source = channel_cmd[1]
 
-        try:
-            cv.positive_int(channel_no)
-        except vol.Invalid:
-            _LOGGER.error("Channel must be positive integer")
+        clean_channel = channel_no.replace(".", "").replace("-", "")
+        if not clean_channel.isdigit():
+            _LOGGER.error("Channel must be a valid number (e.g. 5 or 5.1): %s", channel_no)
             return False
 
         if not await self._async_set_channel_source(channel_source):
@@ -1461,7 +1522,10 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
 
         def send_digit():
             for digit in channel_no:
-                self.send_command("KEY_" + digit)
+                if digit in [".", "-"]:
+                    self.send_command("KEY_DASH")
+                elif digit.isdigit():
+                    self.send_command("KEY_" + digit)
                 sleep(KEYPRESS_DEFAULT_DELAY)
             self.send_command("KEY_ENTER")
 
@@ -1663,10 +1727,13 @@ class SamsungTVDevice(SamsungTVEntity, MediaPlayerEntity):
                 return
         elif self._app_list and source in self._app_list:
             app_id = self._app_list[source]
+            st_app_id = self._app_list_st.get(source, "")
             running_app = source
             await self._async_launch_app(app_id)
+            if st_app_id and st_app_id != app_id:
+                await self.async_send_command(st_app_id, CMD_RUN_APP)
             if self._st:
-                self._st.set_application(self._app_list_st[source])
+                self._st.set_application(st_app_id or app_id)
         elif self._channel_list and source in self._channel_list:
             source_key = self._channel_list[source]
             await self._async_set_channel(source_key)

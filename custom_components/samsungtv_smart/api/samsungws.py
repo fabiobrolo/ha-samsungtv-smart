@@ -561,24 +561,52 @@ class SamsungTVWS:
     def _request_apps_list(self):
         """Request to the TV the list of installed apps."""
         _LOGGING.debug("Request app list")
-        self._ws_send(
-            {
-                "method": "ms.channel.emit",
-                "params": {"event": "ed.installedApp.get", "to": "host"},
-            },
-            key_press_delay=0,
-        )
+        cmd = {
+            "method": "ms.channel.emit",
+            "params": {"event": "ed.installedApp.get", "to": "host"},
+        }
+        self._ws_send(cmd, key_press_delay=0)
+        if self._ws_control and self._is_control_connected:
+            self._ws_send(
+                cmd,
+                key_press_delay=0,
+                use_control=True,
+                ws_socket=self._ws_control,
+            )
 
     def _handle_installed_app(self, response):
         """Manage the list of installed apps received from the TV."""
-        list_app = response.get("data", {}).get("data")
+        data = response.get("data")
+        list_app = None
+        if isinstance(data, dict):
+            list_app = data.get("data")
+        elif isinstance(data, list):
+            list_app = data
+
+        if not list_app:
+            return
+
         installed_app = {}
+        dump_data = {}
         for app_info in list_app:
-            app_id = app_info["appId"]
-            _LOGGING.debug("Found app: %s", app_id)
-            app = App(app_id, app_info["name"], app_info["app_type"])
-            installed_app[app_id] = app
+            try:
+                app_id = app_info.get("appId")
+                name = app_info.get("name")
+                app_type = app_info.get("app_type")
+                if app_id:
+                    _LOGGING.debug("Found app: %s", app_id)
+                    app = App(app_id, name, app_type)
+                    installed_app[app_id] = app
+                    dump_data[name or app_id] = app_id
+            except Exception as exc:  # pylint: disable=broad-except
+                _LOGGING.debug("Error parsing app item %s: %s", app_info, exc)
+
         self._installed_app = installed_app
+        try:
+            with open("/config/samsung_apps_dump.json", "w", encoding="utf-8") as f:
+                json.dump(dump_data, f, indent=2, ensure_ascii=False)
+        except Exception as exc:  # pylint: disable=broad-except
+            _LOGGING.debug("Failed to write /config/samsung_apps_dump.json: %s", exc)
 
     def _client_control_thread(self):
         """Start the client control WS thread used to manage running apps."""
@@ -1146,8 +1174,9 @@ class SamsungTVWS:
             meta_tag,
         )
 
-        if self._ws_control and action_type == TYPE_DEEP_LINK and not use_remote:
-            return self._ws_send(
+        res_ctrl = False
+        if self._ws_control and self._is_control_connected and not meta_tag and not use_remote:
+            res_ctrl = self._ws_send(
                 {
                     "id": app_id,
                     "method": "ms.application.start",
@@ -1158,16 +1187,31 @@ class SamsungTVWS:
                 ws_socket=self._ws_control,
             )
 
-        return self._ws_send(
+        if meta_tag:
+            return self._ws_send(
+                {
+                    "method": "ms.channel.emit",
+                    "params": {
+                        "event": "ed.apps.launch",
+                        "to": "host",
+                        "data": {
+                            "action_type": action_type,
+                            "appId": app_id,
+                            "metaTag": meta_tag,
+                        },
+                    },
+                },
+                key_press_delay=0,
+            )
+
+        res_rem = self._ws_send(
             {
                 "method": "ms.channel.emit",
                 "params": {
                     "event": "ed.apps.launch",
                     "to": "host",
                     "data": {
-                        # action_type: NATIVE_LAUNCH / DEEP_LINK
-                        # app_type == 2 ? 'DEEP_LINK' : 'NATIVE_LAUNCH',
-                        "action_type": action_type,
+                        "action_type": TYPE_DEEP_LINK,
                         "appId": app_id,
                         "metaTag": meta_tag,
                     },
@@ -1175,6 +1219,23 @@ class SamsungTVWS:
             },
             key_press_delay=0,
         )
+
+        res_native = self._ws_send(
+            {
+                "method": "ms.channel.emit",
+                "params": {
+                    "event": "ed.apps.launch",
+                    "to": "host",
+                    "data": {
+                        "action_type": TYPE_NATIVE_LAUNCH,
+                        "appId": app_id,
+                        "metaTag": meta_tag,
+                    },
+                },
+            },
+            key_press_delay=0,
+        )
+        return res_ctrl or res_rem or res_native
 
     def open_browser(self, url):
         """Launch the browser app on the TV."""
